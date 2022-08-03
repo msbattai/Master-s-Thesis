@@ -1,0 +1,556 @@
+---
+title: "Thesis Industry C10"
+author: "Michael Battaile"
+date: "8/2/2022"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 0. Load library and import data
+```{r echo = T, message = F, results = 'hide'}
+library(ranger)
+library(rpart)
+library(rpart.plot)
+library(dplyr)
+library(caret)
+library(Rcpp)
+library(xgboost)
+library(class)
+library(VIM)
+library(GGally)
+library(corrplot)
+library(stargazer)
+library(data.table)
+library(moments)
+```
+
+
+**Load Data**
+```{r}
+#load and import data
+
+data <- read.csv(file = "data_inflation_adjusted.csv", fileEncoding="UTF-8-BOM")
+
+macro_variables <- read.csv(file = "macro_indicators_romania.csv", fileEncoding="UTF-8-BOM")
+
+data <- inner_join(data, macro_variables, by="year")
+
+data <- data[data$nace_division == 10,]
+
+#set seed
+
+set.seed(123)
+```
+
+
+**Convert Data Types**
+```{r}
+#convert data to correct data types
+
+data$reg_number <- as.integer(data$reg_number)
+data$Default <- as.factor(data$Default)
+data$nace_code <- as.factor(data$nace_code)
+data$nace_division <- as.factor(data$nace_division)
+data$nace_section <- as.factor(data$nace_section)
+data$year <- as.numeric(data$year)
+data$noncurrent_assets <- as.numeric(data$noncurrent_assets)
+data$current_assets <- as.numeric(data$current_assets)
+data$inventories <- as.numeric(data$inventories)
+data$receivables <- as.numeric(data$receivables)
+data$cash_and_bank <- as.numeric(data$receivables)
+data$prepaid_expenses <- as.numeric(data$prepaid_expenses)
+data$payables <- as.numeric(data$payables)
+data$advance_payments <- as.numeric(data$advance_payments)
+data$provisions <- as.numeric(data$provisions)
+data$equity <- as.numeric(data$equity)
+data$share_capital <- as.numeric(data$share_capital)
+data$state_owned_capital <- as.numeric(data$state_owned_capital)
+data$public_owned_capital <- as.numeric(data$public_owned_capital)
+data$net_turnover <- as.numeric(data$net_turnover)
+data$total_income <- as.numeric(data$total_income)
+data$total_expenses <- as.numeric(data$total_expenses)
+data$net_profit_or_loss <- as.numeric(data$net_profit_or_loss)
+data$gross_profit_or_loss <- as.numeric(data$gross_profit_or_loss)
+data$employee_count <- as.numeric(data$employee_count)
+data$gdp_growth <- as.numeric(data$gdp_growth)
+data$inflation <- as.numeric(data$inflation)
+data$unemployment <- as.numeric(data$unemployment)
+data$interest <- as.numeric(data$interest)
+```
+
+
+**Convert 0 and NAN to NA**
+```{r}
+#turn 0s and NAN into NA
+
+data[data == 0] <- NA
+
+is.nan.data.frame <- function(x)
+  do.call(cbind, lapply(x, is.nan))
+
+data[is.nan(data)] <- NA
+```
+
+
+**Add YoY Columns**
+```{r}
+#add yoy columns
+
+longitudinal <- data %>%
+  group_by(reg_number) %>% 
+  arrange(year, .by_group = TRUE) %>%
+  mutate(current_assets_yoy = (current_assets/lag(current_assets) - 1) * 100)%>%
+  mutate(receivables_yoy = (receivables/lag(receivables) - 1) * 100) %>%
+  mutate(cash_and_bank_yoy = (cash_and_bank/lag(cash_and_bank) - 1) * 100) %>%
+  mutate(payables_yoy = (payables/lag(payables) - 1) * 100) %>%
+  mutate(equity_yoy = (equity/lag(equity) - 1) * 100) %>%
+  mutate(share_capital_yoy = (share_capital/lag(share_capital) - 1) * 100) %>%
+  mutate(total_expenses_yoy = (total_expenses/lag(total_expenses) - 1) * 100) %>%
+  mutate(gross_profit_or_loss_yoy = (gross_profit_or_loss/lag(gross_profit_or_loss) - 1) * 100) %>%
+  mutate(net_profit_or_loss_yoy = (net_profit_or_loss/lag(net_profit_or_loss) - 1) * 100)
+```
+
+
+**Delete First Year Observations**
+```{r}
+#delete first years
+
+universal_unclean <- longitudinal %>%
+  group_by(reg_number) %>%
+  filter(row_number() > 1)
+
+summary(universal_unclean)
+```
+
+
+**Reduce Variables and Observations w/o Enough Data**
+```{r}
+#reduce variables by 20% or less NAs
+
+universal <- universal_unclean[,which(colMeans(!is.na(universal_unclean)) > 0.8)]
+
+#reduce datapoints by 20% or less NAs
+
+universal <- universal[which(rowMeans(!is.na(universal)) > 0.8),]
+
+summary(universal)
+```
+
+
+**Compute and Check Mean/MEdian Ratio to Judge Skew**
+```{r}
+#compute and check mean/median ratios to judge skew and ideal average for imputation
+
+medians <- c(median(universal$current_assets, na.rm = TRUE),
+             median(universal$payables, na.rm = TRUE),
+             median(universal$equity, na.rm = TRUE),
+             median(universal$share_capital, na.rm = TRUE),
+             median(universal$total_expenses, na.rm = TRUE),
+             median(universal$gross_profit_or_loss, na.rm = TRUE),
+             median(universal$net_profit_or_loss, na.rm = TRUE),
+             median(universal$current_assets_yoy, na.rm = TRUE),
+             median(universal$payables_yoy, na.rm = TRUE),
+             median(universal$equity_yoy, na.rm = TRUE),
+             median(universal$share_capital_yoy, na.rm = TRUE),
+             median(universal$total_expenses_yoy, na.rm = TRUE),
+             median(universal$gross_profit_or_loss_yoy, na.rm = TRUE),
+             median(universal$net_profit_or_loss_yoy, na.rm = TRUE))
+
+means <- c(mean(universal$current_assets, na.rm = TRUE),
+                   mean(universal$payables, na.rm = TRUE),
+                   mean(universal$equity, na.rm = TRUE),
+                   mean(universal$share_capital, na.rm = TRUE),
+                   mean(universal$total_expenses, na.rm = TRUE),
+                   mean(universal$gross_profit_or_loss, na.rm = TRUE),
+                   mean(universal$net_profit_or_loss, na.rm = TRUE),
+                   mean(universal$current_assets_yoy, na.rm = TRUE),
+                   mean(universal$payables_yoy, na.rm = TRUE),
+                   mean(universal$equity_yoy, na.rm = TRUE),
+                   mean(universal$share_capital_yoy, na.rm = TRUE),
+                   mean(universal$total_expenses_yoy, na.rm = TRUE),
+                   mean(universal$gross_profit_or_loss_yoy, na.rm = TRUE),
+                   mean(universal$net_profit_or_loss_yoy, na.rm = TRUE))
+
+standard <- c(sd(universal$current_assets, na.rm = TRUE),
+                   sd(universal$payables, na.rm = TRUE),
+                   sd(universal$equity, na.rm = TRUE),
+                   sd(universal$share_capital, na.rm = TRUE),
+                   sd(universal$total_expenses, na.rm = TRUE),
+                   sd(universal$gross_profit_or_loss, na.rm = TRUE),
+                   sd(universal$net_profit_or_loss, na.rm = TRUE),
+                   sd(universal$current_assets_yoy, na.rm = TRUE),
+                   sd(universal$payables_yoy, na.rm = TRUE),
+                   sd(universal$equity_yoy, na.rm = TRUE),
+                   sd(universal$share_capital_yoy, na.rm = TRUE),
+                   sd(universal$total_expenses_yoy, na.rm = TRUE),
+                   sd(universal$gross_profit_or_loss_yoy, na.rm = TRUE),
+                   sd(universal$net_profit_or_loss_yoy, na.rm = TRUE))
+
+
+skewness <- 3 * (means - medians) / standard
+
+names(skewness) <- c("current_assets", "payables", "equity", "share_capital", "total_expenses", "gross_profit_or_loss", "net_profit_or_loss", "current_assets_yoy", "payables_yoy", "equity_yoy", "share_capital_yoy", "total_expenses_yoy", "gross_profit_or_loss_yoy", "net_profit_or_loss_yoy")
+
+print(skewness)
+```
+
+
+**NA Imputation**
+```{r}
+#NA imputation
+
+universal$current_assets[is.na(universal$current_assets)] <- mean(universal$current_assets, na.rm = TRUE)
+universal$payables[is.na(universal$payables)] <- mean(universal$payables, na.rm = TRUE)
+universal$equity[is.na(universal$equity)] <- mean(universal$equity, na.rm = TRUE)
+universal$share_capital[is.na(universal$share_capital)] <- mean(universal$share_capital, na.rm = TRUE)
+universal$total_expenses[is.na(universal$total_expenses)] <- mean(universal$total_expenses, na.rm = TRUE)
+universal$gross_profit_or_loss[is.na(universal$gross_profit_or_loss)] <- mean(universal$gross_profit_or_loss, na.rm = TRUE)
+universal$net_profit_or_loss[is.na(universal$net_profit_or_loss)] <- mean(universal$net_profit_or_loss, na.rm = TRUE)
+universal$current_assets_yoy[is.na(universal$current_assets_yoy)] <- mean(universal$current_assets_yoy, na.rm = TRUE)
+universal$payables_yoy[is.na(universal$payables_yoy)] <- mean(universal$payables_yoy, na.rm = TRUE)
+universal$equity_yoy[is.na(universal$equity_yoy)] <- mean(universal$equity_yoy, na.rm = TRUE)
+universal$share_capital_yoy[is.na(universal$share_capital_yoy)] <- mean(universal$share_capital_yoy, na.rm = TRUE)
+universal$total_expenses_yoy[is.na(universal$total_expenses_yoy)] <- mean(universal$total_expenses_yoy, na.rm = TRUE)
+universal$gross_profit_or_loss_yoy[is.na(universal$gross_profit_or_loss_yoy)] <- mean(universal$gross_profit_or_loss_yoy, trim = .025, na.rm = TRUE)
+universal$net_profit_or_loss_yoy[is.na(universal$net_profit_or_loss_yoy)] <- mean(universal$net_profit_or_loss_yoy, trim = .025, na.rm = TRUE)
+
+
+universal1 <- universal[c(1,2,3,4,5,13,6,7,8,9,10,11,12,18,19,20,21,22,23,24,14,15,16,17)]
+
+summary(universal1)
+```
+
+
+**Check Correlations for Colinearity**
+```{r}
+#check for strong correlations
+
+universal_numeric <- universal1[7:24]
+
+scaled_data <- as.data.frame(scale(universal_numeric))
+
+cor <- cor(scaled_data, use = "complete.obs")
+
+corrplot(cor, 
+         method = "number", 
+         type = "upper", 
+         order = "hclust", # reorder by the size of the correlation coefficients
+         tl.cex = 0.5, # font size of the variable labels
+         tl.col = "black", # color of the variable labels
+         tl.srt = 45, # rotation angle for the variable labels
+         number.cex = 0.5 # font size of the coefficients
+         )
+```
+
+
+**Remove Highly Correlated Variables**
+```{r}
+#remove correlated variables
+
+reg_data_unclean <- c(universal1[c(6,7,9,10,11,12,14,15,16,17,18,19,20,21,22,24)])
+
+
+reg_data_unclean <- data.frame(reg_data_unclean)
+```
+
+
+**Check for Outliers**
+```{r}
+#check for outliers via boxplot
+
+boxplot <- boxplot(reg_data_unclean)
+```
+
+
+**Remove Outliers**
+```{r}
+#remove outliers
+
+Q <- quantile(reg_data_unclean$current_assets, probs=c(.25, .75), na.rm = FALSE)
+iqr <- IQR(reg_data_unclean$current_assets)
+reg_data_unclean1 <- subset(reg_data_unclean, reg_data_unclean$current_assets > (Q[1] - 1.5*iqr) & reg_data_unclean$current_assets < (Q[2]+1.5*iqr))
+
+Q <- quantile(reg_data_unclean1$total_expenses, probs=c(.25, .75), na.rm = FALSE)
+iqr <- IQR(reg_data_unclean1$total_expenses)
+reg_data_unclean <- subset(reg_data_unclean1, reg_data_unclean1$total_expenses > (Q[1] - 1.5*iqr) & reg_data_unclean1$total_expenses < (Q[2]+1.5*iqr))
+
+Q <- quantile(reg_data_unclean$equity, probs=c(.25, .75), na.rm = FALSE)
+iqr <- IQR(reg_data_unclean$equity)
+reg_data_unclean1 <- subset(reg_data_unclean, reg_data_unclean$equity > (Q[1] - 1.5*iqr) & reg_data_unclean$equity < (Q[2]+1.5*iqr))
+
+Q <- quantile(reg_data_unclean1$total_expenses_yoy, probs=c(.25, .75), na.rm = FALSE)
+iqr <- IQR(reg_data_unclean1$total_expenses_yoy)
+reg_data_unclean <- subset(reg_data_unclean1, reg_data_unclean1$total_expenses_yoy > (Q[1] - 1.5*iqr) & reg_data_unclean1$total_expenses_yoy < (Q[2]+1.5*iqr))
+
+Q <- quantile(reg_data_unclean$net_profit_or_loss_yoy, probs=c(.25, .75), na.rm = FALSE)
+iqr <- IQR(reg_data_unclean$net_profit_or_loss_yoy)
+reg_data_unclean1 <- subset(reg_data_unclean, reg_data_unclean$net_profit_or_loss_yoy > (Q[1] - 1.5*iqr) & reg_data_unclean$net_profit_or_loss_yoy < (Q[2]+1.5*iqr))
+
+Q <- quantile(reg_data_unclean1$share_capital, probs=c(.25, .75), na.rm = FALSE)
+iqr <- IQR(reg_data_unclean1$share_capital)
+reg_data_unclean <- subset(reg_data_unclean1, reg_data_unclean1$share_capital > (Q[1] - 1.5*iqr) & reg_data_unclean1$share_capital < (Q[2]+1.5*iqr))
+
+Q <- quantile(reg_data_unclean$gross_profit_or_loss, probs=c(.25, .75), na.rm = FALSE)
+iqr <- IQR(reg_data_unclean$gross_profit_or_loss)
+reg_data_unclean1 <- subset(reg_data_unclean, reg_data_unclean$gross_profit_or_loss > (Q[1] - 1.5*iqr) & reg_data_unclean$gross_profit_or_loss < (Q[2]+1.5*iqr))
+
+Q <- quantile(reg_data_unclean1$current_assets_yoy, probs=c(.25, .75), na.rm = FALSE)
+iqr <- IQR(reg_data_unclean1$current_assets_yoy)
+reg_data_unclean <- subset(reg_data_unclean1, reg_data_unclean1$current_assets_yoy > (Q[1] - 1.5*iqr) & reg_data_unclean1$current_assets_yoy < (Q[2]+1.5*iqr))
+
+Q <- quantile(reg_data_unclean$payables_yoy, probs=c(.25, .75), na.rm = FALSE)
+iqr <- IQR(reg_data_unclean$payables_yoy)
+reg_data_unclean1 <- subset(reg_data_unclean, reg_data_unclean$payables_yoy > (Q[1] - 1.5*iqr) & reg_data_unclean$payables_yoy < (Q[2]+1.5*iqr))
+
+Q <- quantile(reg_data_unclean1$equity_yoy, probs=c(.25, .75), na.rm = FALSE)
+iqr <- IQR(reg_data_unclean1$equity_yoy)
+reg_data_unclean <- subset(reg_data_unclean1, reg_data_unclean1$equity_yoy > (Q[1] - 1.5*iqr) & reg_data_unclean1$equity_yoy < (Q[2]+1.5*iqr))
+
+Q <- quantile(reg_data_unclean$share_capital_yoy, probs=c(.25, .75), na.rm = FALSE)
+iqr <- IQR(reg_data_unclean$share_capital_yoy)
+reg_data_unclean1 <- subset(reg_data_unclean, reg_data_unclean$share_capital_yoy > (Q[1] - 1.5*iqr) & reg_data_unclean$share_capital_yoy < (Q[2]+1.5*iqr))
+
+Q <- quantile(reg_data_unclean1$gross_profit_or_loss_yoy, probs=c(.25, .75), na.rm = FALSE)
+iqr <- IQR(reg_data_unclean1$gross_profit_or_loss_yoy)
+reg_data <- subset(reg_data_unclean1, reg_data_unclean1$gross_profit_or_loss_yoy > (Q[1] - 1.5*iqr) & reg_data_unclean1$gross_profit_or_loss_yoy < (Q[2]+1.5*iqr))
+
+summary(reg_data)
+```
+
+
+**Take a Sample with Balanced Defaults and Non-Defaults**
+```{r}
+#take a sample with equal defaults and non-defaults
+no_macro <- reg_data[c(1:12)]
+
+defaults <- no_macro[no_macro$Default== "Yes",]
+non_defaults <- no_macro[no_macro$Default== "No",]
+
+default_sample <- defaults[sample(nrow(defaults), 259), ]
+
+non_default_sample <- non_defaults[sample(nrow(non_defaults), 518), ]
+
+sample <- rbind(default_sample, non_default_sample)
+```
+
+
+
+```{r}
+#create data partitions
+
+universal_split <- createDataPartition(sample$Default, 
+                                p = 0.8, list = F)
+universal_train <- sample[universal_split, ]
+universal_test <- sample[-universal_split, ]
+
+summary(universal_train)
+summary(universal_test)
+```
+
+
+*Logistic Regression**
+```{r}
+logistic <- glm(Default ~ ., data = sample, family = binomial(logit))
+
+summary(logistic)
+
+logistic_pred <- predict(logistic, universal_test)
+
+train_control <- trainControl(method = "cv", number = 10)
+
+logistic_fit <- train(Default ~ .,
+                 data = universal_train,
+                 trControl = train_control,
+                 method = "glm",
+                 family = "binomial")
+
+logistic_fit_pred <- predict(logistic_fit, universal_test)
+
+confusionMatrix(logistic_fit_pred, universal_test$Default)
+
+postResample(pred = logistic_fit_pred, obs = universal_test$Default)
+
+logistic_test <- mutate(universal_test,
+                        obs = Default,
+                        pred = predict(logistic_fit, newdata = universal_test),
+                        predict(logistic_fit, newdata = universal_test, type = "prob"))
+
+twoClassSummary(logistic_test, lev = levels(logistic_test$Default))
+```
+
+
+**Random Forests**
+```{r}
+tree = rpart(Default ~ ., data = universal_train)
+
+min_cp <- tree$cptable[which.min(tree$cptable[,"xerror"]),"CP"]
+
+tree_prune <- prune(tree, cp = min_cp)
+
+tree_test_pred <- predict(tree, universal_test)
+
+randomforest_grid_ranger <- expand.grid(mtry = seq(2, 4, length = 1), 
+                                 splitrule = "extratrees",
+                                 min.node.size = 2)
+
+oob <- trainControl(method = "oob")
+
+randomforest_tune <- train(Default ~ ., 
+                           data = universal_train,
+                           method = "ranger",
+                           trControl = oob,
+                           tuneGrid = randomforest_grid_ranger)
+
+pred_randomforest_tune <- predict(randomforest_tune, universal_test)
+
+confusionMatrix(pred_randomforest_tune, universal_test$Default)
+
+postResample(pred_randomforest_tune, universal_test$Default)
+```
+
+
+**Boosted**
+```{r}
+library(xgboost)
+boosting <- train(Default ~ ., 
+                  data = universal_train,
+                  method = "xgbTree",
+                  trControl = trainControl(method = "cv", number = 6)
+)
+
+pred_boosting <- predict(boosting, universal_test)
+
+confusionMatrix(pred_boosting, universal_test$Default)
+
+postResample(pred = pred_boosting, obs = universal_test$Default)
+
+boosting_test <- mutate(universal_test,
+                        obs = Default,
+                        pred = predict(boosting, newdata = universal_test),
+                        predict(boosting, newdata = universal_test, type = "prob"))
+
+twoClassSummary(boosting_test, lev = levels(boosting_test$Default))
+```
+
+
+
+```{r}
+#take a sample with equal defaults and non-defaults
+
+macro <- reg_data
+
+macro_defaults <- macro[macro$Default== "Yes",]
+macro_non_defaults <- macro[macro$Default== "No",]
+
+macro_default_sample <- macro_defaults[sample(nrow(macro_defaults), 259), ]
+
+macro_non_default_sample <- macro_non_defaults[sample(nrow(macro_non_defaults), 518), ]
+
+macro_sample <- rbind(macro_default_sample, macro_non_default_sample)
+```
+
+
+
+```{r}
+#create data partitions
+
+macro_split <- createDataPartition(macro_sample$Default, 
+                                p = 0.8, list = F)
+macro_train <- macro_sample[macro_split, ]
+macro_test <- macro_sample[-macro_split, ]
+
+summary(macro_train)
+summary(macro_test)
+```
+
+
+
+```{r}
+logistic <- glm(Default ~ ., data = macro_sample, family = binomial(logit))
+
+summary(logistic)
+
+logistic_pred <- predict(logistic, macro_test)
+
+train_control <- trainControl(method = "cv", number = 10)
+
+logistic_fit <- train(Default ~ .,
+                 data = macro_train,
+                 trControl = train_control,
+                 method = "glm",
+                 family = "binomial")
+
+logistic_fit_pred <- predict(logistic_fit, macro_test)
+
+confusionMatrix(logistic_fit_pred, macro_test$Default)
+
+postResample(pred = logistic_fit_pred, obs = macro_test$Default)
+
+logistic_test <- mutate(macro_test,
+                        obs = Default,
+                        pred = predict(logistic_fit, newdata = macro_test),
+                        predict(logistic_fit, newdata = macro_test, type = "prob"))
+
+twoClassSummary(logistic_test, lev = levels(logistic_test$Default))
+```
+
+
+
+```{r}
+tree = rpart(Default ~ ., data = macro_train)
+
+min_cp <- tree$cptable[which.min(tree$cptable[,"xerror"]),"CP"]
+
+tree_prune <- prune(tree, cp = min_cp)
+
+tree_test_pred <- predict(tree, macro_test)
+
+randomforest_grid_ranger <- expand.grid(mtry = seq(2, 4, length = 1), 
+                                 splitrule = "extratrees",
+                                 min.node.size = 2)
+
+oob <- trainControl(method = "oob")
+
+randomforest_tune <- train(Default ~ ., 
+                           data = macro_train,
+                           method = "ranger",
+                           trControl = oob,
+                           tuneGrid = randomforest_grid_ranger)
+
+pred_randomforest_tune <- predict(randomforest_tune, macro_test)
+
+confusionMatrix(pred_randomforest_tune, macro_test$Default)
+
+postResample(pred_randomforest_tune, macro_test$Default)
+```
+
+
+
+```{r}
+library(xgboost)
+boosting <- train(Default ~ ., 
+                  data = macro_train,
+                  method = "xgbTree",
+                  trControl = trainControl(method = "cv", number = 6)
+)
+
+pred_boosting <- predict(boosting, macro_test)
+
+confusionMatrix(pred_boosting, macro_test$Default)
+
+postResample(pred = pred_boosting, obs = macro_test$Default)
+
+boosting_test <- mutate(macro_test,
+                        obs = Default,
+                        pred = predict(boosting, newdata = macro_test),
+                        predict(boosting, newdata = macro_test, type = "prob"))
+
+twoClassSummary(boosting_test, lev = levels(boosting_test$Default))
+```
